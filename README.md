@@ -14,9 +14,9 @@ This repository contains the implementation for a __simple__ virtual-machine, al
 
 In addition to the virtual machine interpreter you'll also find:
 
-* [A simple compiler](compiler), written in perl.
+* [A simple compiler](compiler), written in Python 3.
     * This will translate from assembly-source into binary-opcodes.
-* [A simple decompiler](decompiler), written in perl.
+* [A simple decompiler](decompiler), written in Python 3.
     * This will translate in the other direction.
 * Several [example programs](examples/) written in our custom assembly-language.
 * An example of [embedding](src/embedded.c) the virtual machine in a C host program.
@@ -28,8 +28,24 @@ This particular virtual machine is register-based, having ten registers which ca
 
 # Compilation
 
-Because the compiler and decompiler are written in Perl they need no special
-treatment.
+The compiler and decompiler use only the Python 3 standard library.  They
+retain the original positional interface:
+
+    $ ./compiler ./examples/simple.in
+    $ ./decompiler ./examples/simple.raw
+
+The compiler can also emit label metadata alongside the bytecode:
+
+    $ ./compiler --labels-json ./examples/simple.in
+    $ ./decompiler --labels-json ./examples/simple.labels.json ./examples/simple.raw
+
+The metadata is UTF-8 JSON with a versioned `simple-vm-labels` format, the
+bytecode filename, size and SHA-256 digest, plus a mapping from bytecode
+addresses to label names, aliases and source lines.  The decompiler verifies
+the size and digest before using it, then emits label declarations and replaces
+jump, call and label-address operands with their names.  Use
+`--labels-json-file FILE` when a metadata filename other than the default is
+needed (with one input source).
 
 The interpretter, written in C, can be built like so:
 

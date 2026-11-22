@@ -1,671 +1,113 @@
-#!/usr/bin/perl -w
-#
-# This is a simple compiler which will read an input file
-# and spit out the corresponding bytecodes for the program.
-#
-# The only real complexity comes from having to account for labels
-# as our virtual machine only understands absolute jumps.
-#
-#      e.g. Rather than "jmp $+3", or "jmp $-8" we can only write
-#           "jump address", where "address" is an integer 0-64k.
-#
-# To cope with this we initially write all jump-targets as
-# "JMP 0x0000" and keep track of the length of each instruction
-# we've generated.
-#
-# After the whole program has been compiled we can go back and fill
-# in the absolute/real destination for the jumps.
-#
-# Not ideal, but it is simpler than either parsing for-real or
-# using a multi-pass parser.
-#
-#
-# Steve
-# --
-#
-
-
-use strict;
-use warnings;
-
-
-#
-#  These are the bytecodes we understand.
-#
-use constant EXIT => 0x00;
-
-#
-#  Integer things.
-#
-use constant INT_STORE    => 0x01;
-use constant INT_PRINT    => 0x02;
-use constant INT_TOSTRING => 0x03;
-use constant INT_RANDOM   => 0x04;
-
-#
-#  Jumps
-#
-use constant JUMP_TO => 0x10;
-use constant JUMP_Z  => 0x11;
-use constant JUMP_NZ => 0x12;
-
-
-#
-#  Mathematical
-#
-use constant XOR_OP => 0x20;
-use constant ADD_OP => 0x21;
-use constant SUB_OP => 0x22;
-use constant MUL_OP => 0x23;
-use constant DIV_OP => 0x24;
-use constant INC_OP => 0x25;
-use constant DEC_OP => 0x26;
-use constant AND_OP => 0x27;
-use constant OR_OP  => 0x28;
-
-
-#
-#  String operations
-#
-use constant STRING_STORE  => 0x30;
-use constant STRING_PRINT  => 0x31;
-use constant STRING_CONCAT => 0x32;
-use constant STRING_SYSTEM => 0x33;
-use constant STRING_TOINT  => 0x34;
-
-
-#
-#  Comparison functions
-#
-use constant CMP_REG       => 0x40;
-use constant CMP_IMMEDIATE => 0x41;
-use constant CMP_STRING    => 0x42;
-use constant IS_STRING     => 0x43;
-use constant IS_INTEGER    => 0x44;
-
-#
-#  Misc things
-#
-use constant NOP_OP    => 0x50;
-use constant REG_STORE => 0x51;
-
-
-#
-#  Load from RAM/store in RAM
-#
-use constant PEEK   => 0x60;
-use constant POKE   => 0x61;
-use constant MEMCPY => 0x62;
-
-
-#
-#  Stack operations
-#
-use constant STACK_PUSH => 0x70;
-use constant STACK_POP  => 0x71;
-use constant STACK_RET  => 0x72;
-use constant STACK_CALL => 0x73;
-
-
-
-
-#
-#  Get the input file we'll parse
-#
-while ( my $file = shift )
-{
-
-    #
-    #  Storage for any labels we find in the source-file.
-    #
-    my %LABELS;
-
-
-    #
-    #  This stores the offsets we need to update when we've finished
-    # compiling the source.
-    #
-    #  Every time we see a "JUMP $label" statement we output JMP 0x0000
-    # and once the input has been completely parsed we will then go back
-    # and update the output with the real destinations.
-    #
-    #  See the header for more discussion on this topic.
-    #
-    my @UPDATES;
-
-
-    #
-    # Output/compiled programs will have a .raw suffix.
-    #
-    my $output = $file;
-    $output =~ s/\.[^.]+$//;
-    $output .= ".raw";
-
-
-    #
-    #  Open our input/output files.
-    #
-    open( my $in,  "<", $file )   or die "Failed to read source $file - $!";
-    open( my $out, ">", $output ) or die "Failed to write to $output - $!";
-
-
-    #
-    #  Amount of instructions we've output.
-    #
-    #  As instructions aren't the same lengths we need to
-    # ensure we keep track of them so we can calculate jumping
-    # offsets.
-    #
-    my $offset = 0;
-
-    #
-    #  Process each line of the input
-    #
-    while ( my $line = <$in> )
-    {
-
-        #
-        #  Except comments / empty lines.
-        #
-        chomp($line);
-        next if ( !length($line) || ( $line =~ /^\s*#/ ) );
-
-
-        #
-        #  Label definition ":foo"
-        #
-        if ( $line =~ /^\s*:(.*)/ )
-        {
-            my $name = $1;
-
-            # Ensure labels are unique.
-            if ( $LABELS{ $name } )
-            {
-                print "WARNING: Label name '$name' defined multiple times!\n";
-                print "         Picking first occurrence.\n";
-                print "         This is probably your bug.\n";
-            }
-
-            #
-            #  If a label starts with "0x" or is entirely numeric it
-            # WILL be confused for an address.
-            #
-            if ( ( $name =~ /^0x/i ) || ( $name =~ /^([0-9]+)$/ ) )
-            {
-                print
-                  "WARNING: Label named '$name' WILL be confused for an address\n";
-                print "         Strongly consider changing this\n";
-            }
-
-            #
-            # Store the current location of the code in the label.
-            #
-            # We can do this safely because each generator keeps track
-            # of how long and instruction is.
-            #
-            $LABELS{ $name } = $offset;
-        }
-        elsif ( $line =~ /^\s+store\s+#([0-9]+)\s?,\s?"([^"]*)"/ )
-        {
-
-            # store a string
-            my $reg = $1;
-            my $str = $2;
-
-            # expand newlines, etc.
-            $str =~ s/(\\n|\\t)/"qq{$1}"/gee;
-
-            my $len = length($str);
-
-            my $len1 = $len % 256;
-            my $len2 = ( $len - $len1 ) / 256;
-
-            print $out chr STRING_STORE;
-            print $out chr $reg;
-            print $out chr $len1;
-            print $out chr $len2;
-
-
-            print $out $str;
-
-            $offset += 4;              # store + reg + len
-            $offset += length($str);
-        }
-        elsif ( $line =~ /^\s+store\s+#([0-9]+)\s?,\s?#([0-9]+)/ )
-        {
-
-            # store a register contents with another
-            my $dest = $1;
-            my $src  = $2;
-
-            print $out chr REG_STORE;
-            print $out chr $dest;
-            print $out chr $src;
-
-            $offset += 3;    # store + reg1 + reg2
-        }
-        elsif ( $line =~ /^\s+store\s+#([0-9]+)\s?,\s?([^\s]+)/ )
-        {
-
-            # store a label address, or integer
-            my $reg = $1;
-            my $val = $2;
-
-            if ( ( $val =~ /^0x/ ) ||
-                 ( $val =~ /^([0-9]+)$/ ) )
-            {
-
-                #
-                #  If the value is entirely numeric, or starts with 0x
-                # then it is an integer.
-                #
-                $val = hex($val) if ( $val =~ /^0x/i );
-
-                die "Int too large" if ( $val > 65535 );
-
-                my $val1 = $val % 256;
-                my $val2 = ( $val - $val1 ) / 256;
-
-                print $out chr INT_STORE;
-                print $out chr $reg;
-                print $out chr $val1;
-                print $out chr $val2;
-                $offset += 4;    # store + reg + len
-            }
-            else
-            {
-
-                #
-                # Storing the address of a label.
-                #
-                print $out chr INT_STORE;
-                print $out chr $reg;
-                print $out chr 0x00;
-                print $out chr 0x00;
-
-                $offset += 4;    # store + reg + len
-
-                push( @UPDATES,
-                      {  offset => ( $offset - 2 ),
-                         label  => $val
-                      } );
-            }
-        }
-        elsif ( $line =~ /^\s+exit/ )
-        {
-            print $out chr EXIT;
-            $offset += 1;
-        }
-        elsif ( $line =~ /^\s+nop/ )
-        {
-            print $out chr NOP_OP;
-            $offset += 1;
-        }
-        elsif ( $line =~ /^\s*print_int\s?#(.*)/ )
-        {
-            my $reg = $1;
-
-            print $out chr INT_PRINT;
-            print $out chr $reg;
-            $offset += 2;
-        }
-        elsif ( $line =~ /^\s*print_str\s?#(.*)/ )
-        {
-            my $reg = $1;
-
-            print $out chr STRING_PRINT;
-            print $out chr $reg;
-            $offset += 2;
-        }
-        elsif ( $line =~ /^\s*system\s?#(.*)/ )
-        {
-            my $reg = $1;
-
-            print $out chr STRING_SYSTEM;
-            print $out chr $reg;
-            $offset += 2;
-        }
-        elsif ( $line =~ /^\s*(goto|jmp|jmpz|jmpnz|call)\s+([^\s]+)\s*/ )
-        {
-
-            # jump/call
-            my $type = $1;
-            my $dest = $2;
-
-            my %types = ( goto  => JUMP_TO,
-                          jmp   => JUMP_TO,
-                          jmpz  => JUMP_Z,
-                          jmpnz => JUMP_NZ,
-                          call  => STACK_CALL
-                        );
-
-            #
-            #  If the destination begins with 0x or is entirely numeric
-            # then it is an address - otherwise a label.
-            #
-            if ( ( $dest =~ /^0x/ ) ||
-                 ( $dest =~ /^([0-9]+)$/ ) )
-            {
-
-                $dest = hex($dest) if ( $dest =~ /0x/i );
-                my $a1 = $dest % 256;
-                my $a2 = ( $dest - $a1 ) / 256;
-
-                print $out chr $types{ $type };
-                print $out chr $a1;
-                print $out chr $a2;
-                $offset += 3;    # jump + val1 + val2
-
-            }
-            else
-            {
-                print $out chr $types{ $type };
-
-                print $out chr 0;    # this will be updated.
-                print $out chr 0;    # this will be updated.
-
-                $offset += 3;        # jump + val1 + val2
-
-                #
-                # we now need to record the fact we have to patch up this
-                # instruction.
-                #
-                push( @UPDATES,
-                      {  offset => ( $offset - 2 ),
-                         label  => $dest
-                      } );
-            }
-        }
-        elsif ( $line =~
-            /^\s*(add|and|sub|mul|div|or|xor|concat)\s+#([0-9]+)\s*,\s*#([0-9]+)\s*,\s*#([0-9]+)/
-          )
-        {
-
-            #
-            #  Each of these operations compiles to code of the form:
-            #
-            #   OPERATION Result-Register, SrcReg1, SrcReg2
-            #
-            my %maths = ( add    => ADD_OP,
-                          and    => AND_OP,
-                          or     => OR_OP,
-                          sub    => SUB_OP,
-                          mul    => MUL_OP,
-                          div    => DIV_OP,
-                          xor    => XOR_OP,
-                          concat => STRING_CONCAT,
-                        );
-
-            my $opr  = $1;
-            my $dest = $2;
-            my $src1 = $3;
-            my $src2 = $4;
-
-
-            print $out chr $maths{ lc $opr };
-            print $out chr $dest;
-            print $out chr $src1;
-            print $out chr $src2;
-
-            $offset += 4;    # op + dest + src1 + src2
-        }
-        elsif ( $line =~ /^\s*dec\s+#([0-9]+)/ )
-        {
-            my $reg = $1;
-
-            print $out chr DEC_OP;
-            print $out chr $reg;
-
-            $offset += 2;
-        }
-        elsif ( $line =~ /^\s*inc\s+#([0-9]+)/ )
-        {
-            my $reg = $1;
-
-            print $out chr INC_OP;
-            print $out chr $reg;
-
-            $offset += 2;
-        }
-        elsif ( $line =~ /^\s*int2string\s+#([0-9]+)/ )
-        {
-            my $reg = $1;
-
-            print $out chr INT_TOSTRING;
-            print $out chr $reg;
-            $offset += 2;
-        }
-        elsif ( $line =~ /^\s*random\s+#([0-9]+)/ )
-        {
-            my $reg = $1;
-
-            print $out chr INT_RANDOM;
-            print $out chr $reg;
-            $offset += 2;
-        }
-        elsif ( $line =~ /^\s*string2int\s+#([0-9]+)/ )
-        {
-            my $reg = $1;
-
-            print $out chr STRING_TOINT;
-            print $out chr $reg;
-            $offset += 2;
-        }
-        elsif ( $line =~ /^\s*cmp\s+#([0-9]+)\s*,\s*#([0-9]+)\s*/i )
-        {
-
-            # compare two registers
-            my $reg1 = $1;
-            my $reg2 = $2;
-
-            print $out chr CMP_REG;
-            print $out chr $reg1;
-            print $out chr $reg2;
-
-            $offset += 3;
-        }
-        elsif ( $line =~ /^\s+cmp\s+#([0-9]+)\s?,\s?"([^"]*)"/ )
-        {
-
-            # compare a register with a string.
-            my $reg = $1;
-            my $str = $2;
-            my $len = length($str);
-
-            my $len1 = $len % 256;
-            my $len2 = ( $len - $len1 ) / 256;
-
-            print $out chr CMP_STRING;
-            print $out chr $reg;
-            print $out chr $len1;
-            print $out chr $len2;
-
-            print $out $str;
-
-            $offset += 4;              # cmp + reg + len
-            $offset += length($str);
-        }
-        elsif ( $line =~ /^\s*cmp\s+#([0-9]+)\s*,\s*([^\s]+)\s*/i )
-        {
-
-            # compare a register with an int - TODO: Label.
-            my $reg = $1;
-            my $val = $2;
-
-            # convert from hex if appropriate.
-            $val = hex($val) if ( $val =~ /^0x/i );
-
-            my $val1 = $val % 256;
-            my $val2 = ( $val - $val1 ) / 256;
-
-            print $out chr CMP_IMMEDIATE;
-            print $out chr $reg;
-            print $out chr $val1;
-            print $out chr $val2;
-            $offset += 4;    # cmp reg val1 val2
-        }
-        elsif ( $line =~ /^\s*is_(string|integer)\s+#([0-9]+)/ )
-        {
-            my $type = $1;
-            my $reg  = $2;
-
-            if ( $type =~ /string/i )
-            {
-                print $out chr IS_STRING;
-            }
-            if ( $type =~ /integer/i )
-            {
-                print $out chr IS_INTEGER;
-            }
-            print $out chr $reg;
-            $offset += 2;
-        }
-        elsif ( $line =~ /^\s*peek\s+#([0-9]+)\s*,\s*#([0-9]+)/ )
-        {
-            my $reg  = $1;
-            my $addr = $2;
-            print $out chr PEEK;
-            print $out chr $reg;
-            print $out chr $addr;
-
-            $offset += 3;
-        }
-        elsif ( $line =~ /^\s*poke\s+#([0-9]+)\s*,\s*#([0-9]+)/ )
-        {
-            my $reg  = $1;
-            my $addr = $2;
-            print $out chr POKE;
-            print $out chr $reg;
-            print $out chr $addr;
-            $offset += 3;
-        }
-        elsif (
-             $line =~ /^\s*memcpy\s+#([0-9]+)\s*,\s*#([0-9]+)\s*,\s*#([0-9]+)/ )
-        {
-            my $src = $1;
-            my $dst = $2;
-            my $len = $3;
-            print $out chr MEMCPY;
-            print $out chr $src;
-            print $out chr $dst;
-            print $out chr $len;
-
-            $offset += 4;
-        }
-        elsif ( $line =~ /^\s*(push|pop)\s+#([0-9]+)/ )
-        {
-            my $opr = $1;
-            my $reg = $2;
-
-            print $out chr STACK_PUSH if ( $opr =~ /push/i );
-            print $out chr STACK_POP  if ( $opr =~ /pop/i );
-
-            print $out chr $reg;
-
-            $offset += 2;
-        }
-        elsif ( $line =~ /^\s*ret\s*/ )
-        {
-            print $out chr STACK_RET;
-            $offset += 1;
-        }
-        elsif ( $line =~ /^\s*(db|data)\s+(.*)/i )
-        {
-            my $data = $2;
-
-            #
-            #  Split each byte
-            #
-            foreach my $db ( split( /,/, $data ) )
-            {
-
-                # strip leading/trailing space
-                $db =~ s/^\s+|\s+$//g;
-
-                next unless ( length($db) );
-
-                # convert from hex if appropriate
-                $db = hex($db) if ( $db =~ /^0x/i );
-
-                # ensure the byte is within range.
-                die "Data too large for a byte: $db" if ( $db > 255 );
-
-                print $out chr $db;
-
-                $offset += 1;
-            }
-        }
-        else
-        {
-            print "WARNING UNKNOWN LINE: $line\n";
-        }
-    }
-
-
-    if ( $offset < 1 )
-    {
-        print "WARNING: Didn't generate any code\n";
-    }
-
-    #
-    #  Close the input/output files.
-    #
-    close($in);
-    close($out);
-
-    #
-    #  OK now this is nasty - we want to go back and patch up the jump
-    # instructions we know we've emitted.
-    #
-    if ( scalar @UPDATES )
-    {
-
-        #
-        #  Open for in-place editing and make sure we're at the right spot.
-        #
-        open( my $tmp, "+<", $output ) or die "Failed to write to output - $!";
-
-        #
-        #  For each update we must apply
-        #
-        foreach my $update (@UPDATES)
-        {
-
-            #
-            # We have the offset in the output file to update, and the
-            # label which should be replaced with the address.
-            #
-            my $offset = $update->{ 'offset' };
-            my $label  = $update->{ 'label' };
-
-            #
-            #  Seek to the correct location.
-            #
-            seek $tmp, $offset, 0;
-
-            #
-            # now we find the target of the label
-            #
-            my $target = $LABELS{ $label };
-            die "No target for label '$label' - Label not defined!"
-              unless ( defined($target) );
-
-            #
-            # Split the address into two bytes.
-            #
-            my $t1 = $target % 256;
-            my $t2 = ( $target - $t1 ) / 256;
-
-            #
-            # Update the compiled file on-disk.  (Remember the seek?)
-            #
-            print $tmp chr $t1;
-            print $tmp chr $t2;
-        }
-
-        #
-        # Close the updated output file.
-        #
-        close($tmp);
-    }
-}
+#!/usr/bin/env python3
+"""Compile simple.vm assembly to bytecode, optionally with label metadata."""
+import argparse
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+OP = {"exit":0x00,"int_store":0x01,"int_print":0x02,"int_tostring":0x03,"int_random":0x04,"jmp":0x10,"jmpz":0x11,"jmpnz":0x12,"xor":0x20,"add":0x21,"sub":0x22,"mul":0x23,"div":0x24,"inc":0x25,"dec":0x26,"and":0x27,"or":0x28,"string_store":0x30,"string_print":0x31,"concat":0x32,"system":0x33,"string_toint":0x34,"cmp_reg":0x40,"cmp_immediate":0x41,"cmp_string":0x42,"is_string":0x43,"is_integer":0x44,"nop":0x50,"reg_store":0x51,"peek":0x60,"poke":0x61,"memcpy":0x62,"push":0x70,"pop":0x71,"ret":0x72,"call":0x73}
+
+class CompileError(Exception): pass
+def b(value, what="byte"):
+    if not 0 <= value <= 255: raise CompileError(f"{what} must fit in one byte: {value}")
+    return value
+def w(value, what="value"):
+    if not 0 <= value <= 65535: raise CompileError(f"{what} must fit in 16 bits: {value}")
+    return value.to_bytes(2, "little")
+def num(value): return int(value, 16) if value.lower().startswith("0x") else int(value)
+def address(value): return bool(re.fullmatch(r"0[xX][0-9a-fA-F]+|[0-9]+", value))
+def string(value):
+    try: return value.replace(r"\n", "\n").replace(r"\t", "\t").encode("latin-1")
+    except UnicodeEncodeError as exc: raise CompileError("string contains characters outside the byte range") from exc
+
+def compile_file(source):
+    try: lines = source.read_bytes().decode("latin-1").splitlines()
+    except OSError as exc: raise CompileError(f"Failed to read source {source} - {exc}") from exc
+    code, labels, updates = bytearray(), {}, []
+    def emit(*items): code.extend(b(x) for x in items)
+    def emit_target(op, target):
+        emit(op)
+        if address(target): code.extend(w(num(target), "address"))
+        else: updates.append((len(code), target)); code.extend(b"\0\0")
+    for lineno, line in enumerate(lines, 1):
+        if not line or re.match(r"^\s*#", line): continue
+        m = re.match(r"^\s*:(.*)", line)
+        if m:
+            name = m.group(1)
+            if any(x["name"] == name or name in x["aliases"] for x in labels.values()):
+                print(f"WARNING: Label name '{name}' defined multiple times!\n         Picking first occurrence.", file=sys.stderr); continue
+            if re.match(r"^(?:0x|[0-9]+$)", name, re.I): print(f"WARNING: Label named '{name}' WILL be confused for an address", file=sys.stderr)
+            key = str(len(code))
+            if key in labels: labels[key]["aliases"].append(name)
+            else: labels[key] = {"name":name, "aliases":[], "source":{"line":lineno}}
+            continue
+        m = re.match(r'^\s+store\s+#([0-9]+)\s?,\s?"([^"]*)"', line)
+        if m:
+            value = string(m.group(2)); emit(OP["string_store"], num(m.group(1))); code.extend(w(len(value), "string length")); code.extend(value); continue
+        m = re.match(r"^\s+store\s+#([0-9]+)\s?,\s?#([0-9]+)", line)
+        if m: emit(OP["reg_store"], num(m.group(1)), num(m.group(2))); continue
+        m = re.match(r"^\s+store\s+#([0-9]+)\s?,\s?([^\s]+)", line)
+        if m:
+            emit(OP["int_store"], num(m.group(1))); target=m.group(2)
+            if address(target): code.extend(w(num(target), "integer"))
+            else: updates.append((len(code), target)); code.extend(b"\0\0")
+            continue
+        if re.match(r"^\s+exit", line): emit(OP["exit"]); continue
+        if re.match(r"^\s+nop", line): emit(OP["nop"]); continue
+        m = re.match(r"^\s*(print_int|print_str|system)\s?#(.*)", line)
+        if m: emit(OP[{"print_int":"int_print","print_str":"string_print","system":"system"}[m.group(1)]], num(m.group(2))); continue
+        m = re.match(r"^\s*(goto|jmp|jmpz|jmpnz|call)\s+([^\s]+)", line)
+        if m: emit_target(OP[{"goto":"jmp","jmp":"jmp","jmpz":"jmpz","jmpnz":"jmpnz","call":"call"}[m.group(1)]], m.group(2)); continue
+        m = re.match(r"^\s*(add|and|sub|mul|div|or|xor|concat)\s+#([0-9]+)\s*,\s*#([0-9]+)\s*,\s*#([0-9]+)", line)
+        if m: emit(OP[m.group(1)], *map(num, m.groups()[1:])); continue
+        m = re.match(r"^\s*(dec|inc|int2string|random|string2int)\s+#([0-9]+)", line)
+        if m: emit(OP[{"dec":"dec","inc":"inc","int2string":"int_tostring","random":"int_random","string2int":"string_toint"}[m.group(1)]], num(m.group(2))); continue
+        m = re.match(r"^\s*cmp\s+#([0-9]+)\s*,\s*#([0-9]+)\s*", line, re.I)
+        if m: emit(OP["cmp_reg"], num(m.group(1)), num(m.group(2))); continue
+        m = re.match(r'^\s+cmp\s+#([0-9]+)\s?,\s?"([^"]*)"', line)
+        if m:
+            value=string(m.group(2)); emit(OP["cmp_string"],num(m.group(1))); code.extend(w(len(value),"string length")); code.extend(value); continue
+        m = re.match(r"^\s*cmp\s+#([0-9]+)\s*,\s*([^\s]+)\s*", line, re.I)
+        if m: emit(OP["cmp_immediate"],num(m.group(1))); code.extend(w(num(m.group(2)), "integer")); continue
+        m = re.match(r"^\s*is_(string|integer)\s+#([0-9]+)", line)
+        if m: emit(OP["is_"+m.group(1)],num(m.group(2))); continue
+        m = re.match(r"^\s*(peek|poke)\s+#([0-9]+)\s*,\s*#([0-9]+)", line)
+        if m: emit(OP[m.group(1)],num(m.group(2)),num(m.group(3))); continue
+        m = re.match(r"^\s*memcpy\s+#([0-9]+)\s*,\s*#([0-9]+)\s*,\s*#([0-9]+)", line)
+        if m: emit(OP["memcpy"],*map(num,m.groups())); continue
+        m = re.match(r"^\s*(push|pop)\s+#([0-9]+)", line)
+        if m: emit(OP[m.group(1)],num(m.group(2))); continue
+        if re.match(r"^\s*ret\s*", line): emit(OP["ret"]); continue
+        m = re.match(r"^\s*(?:db|data)\s+(.*)", line, re.I)
+        if m:
+            for value in m.group(1).split(","):
+                if value.strip(): emit(num(value.strip()))
+            continue
+        print(f"WARNING UNKNOWN LINE: {line}", file=sys.stderr)
+    if not code: print("WARNING: Didn't generate any code", file=sys.stderr)
+    names={entry["name"]:int(offset) for offset,entry in labels.items()}
+    names.update({alias:int(offset) for offset,entry in labels.items() for alias in entry["aliases"]})
+    for offset, name in updates:
+        if name not in names: raise CompileError(f"No target for label '{name}' - Label not defined!")
+        code[offset:offset+2]=w(names[name],"label address")
+    return bytes(code), labels
+
+def main():
+    parser=argparse.ArgumentParser(description="Compile simple.vm assembly to bytecode.")
+    parser.add_argument("sources",nargs="+",type=Path)
+    parser.add_argument("--labels-json",action="store_true",help="write metadata as <output>.labels.json")
+    parser.add_argument("--labels-json-file",type=Path,metavar="FILE",help="write metadata to FILE (one source only)")
+    args=parser.parse_args()
+    if args.labels_json_file and len(args.sources)!=1: parser.error("--labels-json-file requires exactly one source")
+    try:
+        for source in args.sources:
+            code,labels=compile_file(source); output=source.with_suffix(".raw"); output.write_bytes(code)
+            if args.labels_json or args.labels_json_file:
+                path=args.labels_json_file or output.with_suffix(".labels.json")
+                doc={"format":"simple-vm-labels","version":1,"bytecode":{"file":output.name,"sha256":hashlib.sha256(code).hexdigest(),"size":len(code)},"labels":labels}
+                path.write_text(json.dumps(doc,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
+    except (CompileError,OSError,ValueError) as exc: print(f"compiler: {exc}",file=sys.stderr); return 1
+    return 0
+if __name__=="__main__": raise SystemExit(main())
