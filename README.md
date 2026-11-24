@@ -14,9 +14,9 @@ This repository contains the implementation for a __simple__ virtual-machine, al
 
 In addition to the virtual machine interpreter you'll also find:
 
-* [A simple compiler](compiler), written in Python 3.
+* [A simple compiler](compiler.py), written in Python 3.
     * This will translate from assembly-source into binary-opcodes.
-* [A simple decompiler](decompiler), written in Python 3.
+* [A simple decompiler](decompiler.py), written in Python 3.
     * This will translate in the other direction.
 * Several [example programs](examples/) written in our custom assembly-language.
 * An example of [embedding](src/embedded.c) the virtual machine in a C host program.
@@ -31,13 +31,13 @@ This particular virtual machine is register-based, having ten registers which ca
 The compiler and decompiler use only the Python 3 standard library.  They
 retain the original positional interface:
 
-    $ ./compiler ./examples/simple.in
-    $ ./decompiler ./examples/simple.raw
+    $ ./compiler.py ./examples/simple.in
+    $ ./decompiler.py ./examples/simple.raw
 
 The compiler can also emit label metadata alongside the bytecode:
 
-    $ ./compiler --labels-json ./examples/simple.in
-    $ ./decompiler --labels-json ./examples/simple.labels.json ./examples/simple.raw
+    $ ./compiler.py --labels-json ./examples/simple.in
+    $ ./decompiler.py --labels-json ./examples/simple.labels.json ./examples/simple.raw
 
 The metadata is UTF-8 JSON with a versioned `simple-vm-labels` format, the
 bytecode filename, size and SHA-256 digest, plus a mapping from bytecode
@@ -187,7 +187,7 @@ This program first stores the string "`I like loops`" in register 1, then prints
 
 To actually compile this program into bytecode run:
 
-      $ ./compiler ./examples/simple.in
+      $ ./compiler.py ./examples/simple.in
 
 This will produce an output file full of binary-opcodes in the file `simple.raw`:
 
@@ -217,7 +217,7 @@ If you wish to fuzz-test with [afl](http://lcamtuf.coredump.cx/afl/) you should 
 You can compile each of our bundled samples like so:
 
      cd examples/
-     for i in *.in; do ../compiler $i; done
+     for i in *.in; do ../compiler.py $i; done
      cd ..
 
 This will compile `examples/*.in` into `examples/*.raw`.  Place those in a directory, and start your fuzzer:
